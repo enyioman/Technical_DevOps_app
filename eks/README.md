@@ -12,39 +12,13 @@ export PROJECT=cognetiks-tech
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ```
 
-## Build & Push the Docker image to ECR
-
-Create the repo once (idempotent):
-
-```
-aws ecr describe-repositories --repository-names ${PROJECT}-app \
-  >/dev/null 2>&1 || \
-aws ecr create-repository --repository-name ${PROJECT}-app
-```
-
-
-Login & push:
-
-```
-aws ecr get-login-password --region $AWS_REGION \
- | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
-```
-
-```
-docker build -t ${PROJECT}-app:latest .
-
-docker tag  ${PROJECT}-app:latest \
-  ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT}-app:latest
-
-docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT}-app:latest
-```
-
 ## Provision VPC, EKS & RDS with Terraform
 
 From infrastructure/:
 
 ```
-cd infrastructure
+cd Technical_DevOps_app/eks/infrastructure
+
 terraform init
 
 # Set/confirm variables in terraform.tfvars (project, region, cidrs, node sizes, etc.)
@@ -70,11 +44,42 @@ aws eks update-kubeconfig --name ${PROJECT}-eks --region ${AWS_REGION} --alias $
 kubectl config use-context ${PROJECT}-eks
 ```
 
+## Build & Push the Docker image to ECR
+
+Create the repo once (idempotent):
+
+```
+aws ecr describe-repositories --repository-names ${PROJECT}-app \
+  >/dev/null 2>&1 || \
+aws ecr create-repository --repository-name ${PROJECT}-app
+```
+
+
+Login & push:
+
+```
+aws ecr get-login-password --region $AWS_REGION \
+ | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+```
+
+```
+cd Technical_DevOps_app
+docker build -t ${PROJECT}-app:latest .
+
+docker tag  ${PROJECT}-app:latest \
+  ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT}-app:latest
+
+docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT}-app:latest
+```
+
+
+
 ## Install monitoring (Prometheus + Grafana)
 
 We’ll use kube-prometheus-stack and expose Grafana via ELB:
 
 ```
+cd Technical_DevOps_app/eks/django-app
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 helm repo update
 
@@ -193,5 +198,9 @@ terraform destroy -auto-approve
 
 # Delete ECR repo/images when done
 aws ecr delete-repository --repository-name ${PROJECT}-app --force
+
+# Delete infrastructure
+cd Technical_DevOps_app/eks/infrastructure
+terraform destroy
 ```
 

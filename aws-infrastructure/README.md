@@ -47,7 +47,7 @@ alert_email     = "you@example.com"
 From the Terraform directory that contains your modules (infrastructure/ or root of the stack):
 
 ```
-cd aws-infrastructure
+cd Technical_DevOps_app/aws-infrastructure
 
 export AWS_REGION=us-east-1
 

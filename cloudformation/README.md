@@ -35,8 +35,12 @@ Click Create stack and watch Events until CREATE_COMPLETE.
 
 Copy values from the Outputs tab (e.g., AlbDnsName).
 
-Option B — Deploy via AWS CLI (recommended for reproducibility)
+## Option B — Deploy via AWS CLI (recommended for reproducibility)
+
 1) Set common variables (edit to your values)
+```
+cd Technical_DevOps_app/cloudformation
+
 export REGION=us-east-1
 export STACK_NAME=cognetiks-tech
 export PROJECT=cognetiks-tech
@@ -45,11 +49,14 @@ export STATIC_BUCKET=cognetiks-tech-static-bucket
 export LOGS_BUCKET=cognetiks-tech-logs-bucket
 export DB_PASSWORD='ChangeMeToAStrongOne!'
 export APP_REPO_URL='https://github.com/enyioman/Technical_DevOps_app.git'
+```
 
 2) Validate the template
+```
 aws cloudformation validate-template \
   --region "$REGION" \
   --template-body file://stack.yaml
+```
 
 3) Create the stack
 ```
