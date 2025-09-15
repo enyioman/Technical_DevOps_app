@@ -30,7 +30,6 @@ aws ecr get-login-password --region $AWS_REGION \
  | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
 ```
 
-## Build image and push to AWS registry
 ```
 docker build -t ${PROJECT}-app:latest .
 
@@ -71,7 +70,7 @@ aws eks update-kubeconfig --name ${PROJECT}-eks --region ${AWS_REGION} --alias $
 kubectl config use-context ${PROJECT}-eks
 ```
 
-3) Install monitoring (Prometheus + Grafana)
+## Install monitoring (Prometheus + Grafana)
 
 We’ll use kube-prometheus-stack and expose Grafana via ELB:
 
