@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "django-app.fullname" . }}-settings
+data:
+  settings_local.py: |
+    from .settings import *
+    import os
+    # Pick up ALLOWED_HOSTS from env; fallback to localhost if not set
+    ALLOWED_HOSTS = [h.strip() for h in os.getenv("ALLOWED_HOSTS","").split(",") if h.strip()] or ["*"]
+    # If DB env vars are present, use Postgres; else fall back to sqlite in base settings
+    if all(os.getenv(k) for k in ["RDS_DB_NAME","RDS_USERNAME","RDS_PASSWORD","RDS_HOSTNAME"]):
+        DATABASES = {
+            "default": {
+                "ENGINE": "django.db.backends.postgresql_psycopg2",
+                "NAME": os.getenv("RDS_DB_NAME"),
+                "USER": os.getenv("RDS_USERNAME"),
+                "PASSWORD": os.getenv("RDS_PASSWORD"),
+                "HOST": os.getenv("RDS_HOSTNAME"),
+                "PORT": os.getenv("RDS_PORT", "5432"),
+            }
+        }

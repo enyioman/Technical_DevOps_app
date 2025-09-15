@@ -1,0 +1,17 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "django-app.fullname" . }}-metrics
+  labels:
+    {{- include "django-app.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector: {{- include "django-app.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9102
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

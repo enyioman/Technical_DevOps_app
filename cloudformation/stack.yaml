@@ -1,0 +1,912 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Full stack for Django on ASG behind ALB with RDS, S3, SSM bootstrap, VPC endpoints, and alarms.
+
+Parameters:
+  Project:
+    Type: String
+    Default: cognetiks-tech
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+  InstanceType:
+    Type: String
+    Default: t2.micro
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 Key Pair name
+  ImageIdParameter:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: AL2 x86_64 AMI via SSM
+  AppRepoUrl:
+    Type: String
+    Default: https://github.com/cognetiks/Technical_DevOps_app.git
+  AppBranch:
+    Type: String
+    Default: main
+  WsgiModule:
+    Type: String
+    Default: mysite.wsgi:application
+  StaticBucketName:
+    Type: String
+    Default: yorman-django-static-1234
+  LogsBucketName:
+    Type: String
+    Default: yorman-django-logs-1234
+  AlertEmail:
+    Type: String
+    Default: fynewily@gmail.com
+  DBName:
+    Type: String
+    Default: appdb
+  DBUser:
+    Type: String
+    Default: appuser
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Strong DB master password
+  DBPort:
+    Type: Number
+    Default: 5432
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  MultiAZ:
+    Type: String
+    AllowedValues: [true, false]
+    Default: true
+  MinSize:
+    Type: Number
+    Default: 2
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+  MaxSize:
+    Type: Number
+    Default: 2
+  CreateS3GatewayEndpoint:
+    Type: String
+    AllowedValues: [true, false]
+    Default: true
+
+Conditions:
+  UseS3GatewayEndpoint: !Equals [ !Ref CreateS3GatewayEndpoint, 'true' ]
+  UseMultiAZ:           !Equals [ !Ref MultiAZ, 'true' ]
+Mappings: {}
+
+Resources:
+
+  # ---------------- VPC + Subnets + IGW + NAT ----------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub '${Project}-vpc' }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Derive 4 /24s from the VPC CIDR: Pub1, Pub2, Priv1, Priv2
+  SubnetCidrBlocks:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/tmp/${Project}/subnetcidrs'  # ephemeral helper (not used directly)
+      Type: String
+      Value: !Join
+        - ','
+        - !Cidr [ !Ref VpcCidr, 4, 8 ]
+
+  # We'll select AZ0 and AZ1
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [ !Ref VpcCidr, 4, 8 ]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${Project}-public-0' }]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [ !Ref VpcCidr, 4, 8 ]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${Project}-public-1' }]
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [ !Ref VpcCidr, 4, 8 ]]
+      Tags: [{ Key: Name, Value: !Sub '${Project}-private-0' }]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [ !Ref VpcCidr, 4, 8 ]]
+      Tags: [{ Key: Name, Value: !Sub '${Project}-private-1' }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------- S3: static + logs ----------------
+  StaticBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref StaticBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref LogsBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSLogDeliveryWrite
+            Effect: Allow
+            Principal:
+              Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+
+  # ---------------- ALB (SG, LB, TG, Listener) ----------------
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Project}-alb-sg'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub '${Project}-alb-sg' }]
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${Project}-alb'
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [ !Ref ALBSecurityGroup ]
+      Subnets: [ !Ref PublicSubnet1, !Ref PublicSubnet2 ]
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref LogsBucketName
+        - Key: access_logs.s3.prefix
+          Value: alb
+      Tags: [{ Key: Name, Value: !Sub '${Project}-alb' }]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /healthz
+      Matcher:
+        HttpCode: '200-399'
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      Tags: [{ Key: Name, Value: !Sub '${Project}-tg' }]
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------- EC2 IAM Role/Policy + Instance Profile ----------------
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Project}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: !Sub '${Project}-app-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: '*'
+              - Effect: Allow
+                Action: [ s3:PutObject, s3:GetObject, s3:ListBucket ]
+                Resource:
+                  - !GetAtt StaticBucket.Arn
+                  - !Sub '${StaticBucket.Arn}/*'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${Project}-ec2-profile'
+      Roles: [ !Ref EC2Role ]
+
+  # ---------------- EC2 SG (ALB->EC2:80) ----------------
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Project}-ec2-sg'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub '${Project}-ec2-sg' }]
+
+  # ---------------- Launch Template + ASG ----------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${Project}-lt'
+      LaunchTemplateData:
+        ImageId: !Ref ImageIdParameter
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: !Ref InstanceProfile
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: false
+            Groups: [ !Ref EC2SecurityGroup ]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub '${Project}-app' }]
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            set -euxo pipefail
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y nginx
+            else
+              amazon-linux-extras install -y nginx1 || yum install -y nginx
+            fi
+            cat >/etc/nginx/nginx.conf <<'CONF'
+            user nginx;
+            worker_processes auto;
+            error_log /var/log/nginx/error.log;
+            pid /run/nginx.pid;
+            events { worker_connections 1024; }
+            http {
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+              access_log /var/log/nginx/access.log combined;
+              sendfile on;
+              keepalive_timeout 65;
+              include /etc/nginx/conf.d/*.conf;
+            }
+            CONF
+            mkdir -p /etc/nginx/conf.d
+            cat >/etc/nginx/conf.d/health.conf <<'CONF'
+            server {
+              listen 80 default_server;
+              server_name _;
+              location = /healthz { default_type text/plain; return 200 "ok\n"; }
+              location / { return 200 "booting\n"; }
+            }
+            CONF
+            nginx -t
+            systemctl enable --now nginx
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${Project}-asg'
+      VPCZoneIdentifier: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      MinSize: !Ref MinSize
+      DesiredCapacity: !Ref DesiredCapacity
+      MaxSize: !Ref MaxSize
+      TargetGroupARNs: [ !Ref TargetGroup ]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-app'
+          PropagateAtLaunch: true
+
+  # ---------------- RDS + SG + SubnetGroup ----------------
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Project}-rds-sg'
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub '${Project}-rds-sg' }]
+
+  RDSEgressFromASG:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref DBPort
+      ToPort: !Ref DBPort
+      SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${Project}-dbsubnet'
+      DBSubnetGroupDescription: Subnets for RDS
+      SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      Tags: [{ Key: Name, Value: !Sub '${Project}-dbsubnet' }]
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${Project}-pg'
+      Engine: postgres
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [ !Ref RDSSecurityGroup ]
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      Port: !Ref DBPort
+      MultiAZ: !If [ UseMultiAZ, true, false ]
+      PubliclyAccessible: false
+      DeletionProtection: false
+      Tags: [{ Key: Name, Value: !Sub '${Project}-pg' }]
+
+  # ---------------- Secrets Manager (JSON for app) ----------------
+  AppDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${Project}-db-secret'
+      Description: RDS credentials for the app
+      SecretString: !Sub |
+        {
+          "username": "${DBUser}",
+          "password": "${DBPassword}",
+          "host": "${DBInstance.Endpoint.Address}",
+          "port": "${DBPort}",
+          "dbname": "${DBName}"
+        }
+
+  # ---------------- SSM Document + Association (bootstrap Django) ----------------
+  BootstrapDjangoDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${Project}-bootstrap-django'
+      DocumentType: Command
+      Content:
+        schemaVersion: '2.2'
+        description: Bootstrap Django behind Nginx/Gunicorn on ASG instances (AL2/AL2023)
+        parameters:
+          AppRepoUrl:   { type: String }
+          AppBranch:    { type: String }
+          AllowedHosts: { type: String }
+          SecretName:   { type: String }
+          StaticBucket: { type: String }
+          Region:       { type: String }
+          Project:      { type: String }
+          WsgiModule:   { type: String }
+        mainSteps:
+          - action: aws:runShellScript
+            name: bootstrap
+            inputs:
+              runCommand:
+                - |
+                  set -euxo pipefail
+
+                  REGION="{{ Region }}"
+                  PROJECT="{{ Project }}"
+                  APP_DIR=/opt/app
+                  APP_REPO_URL="{{ AppRepoUrl }}"
+                  APP_BRANCH="{{ AppBranch }}"
+                  ALLOWED_HOSTS="{{ AllowedHosts }}"
+                  SECRET_NAME="{{ SecretName }}"
+                  STATIC_BUCKET="{{ StaticBucket }}"
+                  WSGI_MODULE="{{ WsgiModule }}"
+
+                  # --- Packages (detect AL2023 vs AL2) ---
+                  if command -v dnf >/dev/null 2>&1; then
+                    # Amazon Linux 2023
+                    dnf install -y nginx git jq nmap-ncat python3.11 python3.11-pip amazon-cloudwatch-agent
+                    PY=python3.11
+                  else
+                    # Amazon Linux 2
+                    yum makecache fast || true
+                    amazon-linux-extras install -y nginx1 || yum install -y nginx
+                    yum install -y git jq nmap-ncat amazon-cloudwatch-agent || true
+                    # Prefer python3.8 (Django 4.2+ needs >=3.8)
+                    amazon-linux-extras enable python3.8 || true
+                    yum clean metadata || true
+                    yum install -y python3.8 || yum install -y python38 || yum install -y python3
+                    PY=$(command -v python3.8 || command -v python38 || command -v python3)
+                  fi
+
+                  # --- Nginx config: healthz + proxy to 127.0.0.1:8000 ---
+                  rm -f /etc/nginx/conf.d/*.conf || true
+                  mkdir -p /etc/nginx/conf.d
+                  cat >/etc/nginx/nginx.conf <<'CONF'
+                  user nginx;
+                  worker_processes auto;
+                  error_log /var/log/nginx/error.log;
+                  pid /run/nginx.pid;
+
+                  events { worker_connections 1024; }
+
+                  http {
+                    include /etc/nginx/mime.types;
+                    default_type text/html;
+                    access_log /var/log/nginx/access.log combined;
+                    sendfile on;
+                    keepalive_timeout 65;
+                    include /etc/nginx/conf.d/*.conf;
+                  }
+                  CONF
+
+                  cat >/etc/nginx/conf.d/app.conf <<'CONF'
+                  server {
+                    listen 80 default_server;
+                    server_name _;
+                    # Simple health endpoint for ALB
+                    location = /healthz { default_type text/plain; return 200 "ok\n"; }
+
+                    # Proxy everything else to Gunicorn
+                    location / {
+                      proxy_pass         http://127.0.0.1:8000;
+                      # Force loopback host so Django never hits DisallowedHost
+                      proxy_set_header   Host 127.0.0.1;
+                      proxy_set_header   X-Real-IP $remote_addr;
+                      proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header   X-Forwarded-Proto $scheme;
+                      proxy_read_timeout 60s;
+                    }
+                  }
+                  CONF
+
+                  # Prevent static welcome page from hijacking /
+                  rm -f /usr/share/nginx/html/index.html || true
+
+                  nginx -t
+                  systemctl enable --now nginx
+                  systemctl reload nginx || true
+
+                  # --- App code ---
+                  if [ ! -d "$APP_DIR/.git" ]; then
+                    git clone -b "$APP_BRANCH" "$APP_REPO_URL" "$APP_DIR"
+                  else
+                    cd "$APP_DIR" && git fetch && git checkout "$APP_BRANCH" && git pull
+                  fi
+                  cd "$APP_DIR"
+
+                  # --- Python venv + deps ---
+                  $PY -m venv "$APP_DIR/venv"
+                  source "$APP_DIR/venv/bin/activate"
+                  pip install --upgrade pip
+                  pip install -r requirements.txt gunicorn boto3 django-storages
+
+                  cat >/opt/app/mysite/settings_local.py <<'PY'
+                  from .settings import *
+                  import os
+                  ALLOWED_HOSTS = [h.strip() for h in os.getenv("ALLOWED_HOSTS","").split(",") if h.strip()] or ["localhost","127.0.0.1"]
+                  PY
+
+                  # --- DB secrets (Secrets Manager JSON: {username,password,host,port,dbname}) ---
+                  SECRET_JSON=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_NAME" --query SecretString --output text || echo '{}')
+                  DB_NAME=$(echo "$SECRET_JSON" | jq -r '.dbname // empty')
+                  DB_USER=$(echo "$SECRET_JSON" | jq -r '.username // empty')
+                  DB_PASS=$(echo "$SECRET_JSON" | jq -r '.password // empty')
+                  DB_HOST=$(echo "$SECRET_JSON" | jq -r '.host // empty')
+                  DB_PORT=$(echo "$SECRET_JSON" | jq -r '.port // "5432"')
+
+                  # --- Gunicorn env ---
+                  cat >/etc/sysconfig/gunicorn <<EOF
+                  DJANGO_SETTINGS_MODULE=mysite.settings_local
+                  ALLOWED_HOSTS=$ALLOWED_HOSTS
+                  AWS_DEFAULT_REGION=$REGION
+                  AWS_STORAGE_BUCKET_NAME=$STATIC_BUCKET
+                  RDS_DB_NAME=$DB_NAME
+                  RDS_USERNAME=$DB_USER
+                  RDS_PASSWORD=$DB_PASS
+                  RDS_HOSTNAME=$DB_HOST
+                  RDS_PORT=$DB_PORT
+                  EOF
+
+                  # Django log files
+                  mkdir -p /var/log/gunicorn
+                  chmod 755 /var/log/gunicorn
+
+                  # --- Gunicorn service (uses venv + env file) ---
+                  cat >/etc/systemd/system/gunicorn.service <<UNIT
+                  [Unit]
+                  Description=Gunicorn for Django
+                  After=network-online.target nginx.service
+                  Wants=network-online.target
+
+                  [Service]
+                  WorkingDirectory=$APP_DIR
+                  EnvironmentFile=-/etc/sysconfig/gunicorn
+                  ExecStartPre=/usr/bin/env bash -lc '$APP_DIR/venv/bin/python manage.py migrate --noinput || true'
+                  ExecStart=$APP_DIR/venv/bin/gunicorn $WSGI_MODULE --bind 127.0.0.1:8000 --workers 3 --timeout 60 \
+                    --access-logfile /var/log/gunicorn/access.log \
+                    --error-logfile /var/log/gunicorn/error.log
+                  Restart=on-failure
+                  RestartSec=3
+
+                  [Install]
+                  WantedBy=multi-user.target
+                  UNIT
+
+                  systemctl daemon-reload
+                  systemctl enable --now gunicorn
+
+                  # --- Static (non-fatal) ---
+                  $APP_DIR/venv/bin/python manage.py collectstatic --noinput || true
+
+                  # ---------------- CloudWatch Agent: install, configure, start ----------------
+                  CFG_ROOT=/opt/aws/amazon-cloudwatch-agent/etc
+                  LOG_PREFIX="/$PROJECT"
+
+                  mkdir -p "$CFG_ROOT" "$CFG_ROOT/amazon-cloudwatch-agent.d" /opt/aws/amazon-cloudwatch-agent/logs
+
+                  # Write JSON; keep $${aws:*} escaped for CW agent to expand
+                  cat >"$CFG_ROOT/amazon-cloudwatch-agent.json" <<'JSON'
+                  {
+                    "agent": {
+                      "metrics_collection_interval": 60,
+                      "run_as_user": "root",
+                      "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log"
+                    },
+                    "metrics": {
+                      "append_dimensions": {
+                        "AutoScalingGroupName": "$${aws:AutoScalingGroupName}",
+                        "InstanceId": "$${aws:InstanceId}"
+                      },
+                      "metrics_collected": {
+                        "cpu": { "resources": ["*"], "measurement": ["usage_user","usage_system","usage_idle"], "totalcpu": true, "append_dimensions": {} },
+                        "mem": { "measurement": ["used_percent","available"] },
+                        "disk": { "resources": ["*"], "measurement": ["used_percent"] }
+                      }
+                    },
+                    "logs": {
+                      "logs_collected": {
+                        "files": {
+                          "collect_list": [
+                            {
+                              "file_path": "/var/log/nginx/access.log",
+                              "log_group_name": "__LOG_PREFIX__/nginx/access",
+                              "log_stream_name": "{instance_id}",
+                              "retention_in_days": -1
+                            },
+                            {
+                              "file_path": "/var/log/nginx/error.log",
+                              "log_group_name": "__LOG_PREFIX__/nginx/error",
+                              "log_stream_name": "{instance_id}",
+                              "retention_in_days": -1
+                            },
+                            {
+                              "file_path": "/var/log/gunicorn/access.log",
+                              "log_group_name": "__LOG_PREFIX__/gunicorn",
+                              "log_stream_name": "{instance_id}",
+                              "retention_in_days": -1
+                            },
+                            {
+                              "file_path": "/var/log/gunicorn/error.log",
+                              "log_group_name": "__LOG_PREFIX__/gunicorn",
+                              "log_stream_name": "{instance_id}",
+                              "retention_in_days": -1
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                  JSON
+
+                  sed -i "s|__LOG_PREFIX__|$LOG_PREFIX|g" "$CFG_ROOT/amazon-cloudwatch-agent.json"
+
+                  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                    -a fetch-config -m ec2 -c file:$CFG_ROOT/amazon-cloudwatch-agent.json -s
+
+                  # --- Smoke: ensure healthz works locally ---
+                  curl -sfI http://127.0.0.1/healthz
+
+  BootstrapAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: !Ref BootstrapDjangoDoc
+      Targets:
+        - Key: tag:aws:autoscaling:groupName
+          Values: [ !Ref AutoScalingGroup ]
+      ScheduleExpression: rate(30 minutes)
+      ApplyOnlyAtCronInterval: false
+      MaxConcurrency: 100%
+      MaxErrors: '1'
+      ComplianceSeverity: CRITICAL
+      Parameters:
+        AppRepoUrl: [ !Ref AppRepoUrl ]
+        AppBranch: [ !Ref AppBranch ]
+        AllowedHosts: [ !Sub '${ALB.DNSName},localhost,127.0.0.1' ]
+        SecretName: [ !Ref AppDBSecret ]
+        StaticBucket: [ !Ref StaticBucketName ]
+        Region: [ !Ref 'AWS::Region' ]
+        Project: [ !Ref Project ]
+        WsgiModule: [ !Ref WsgiModule ]
+
+  # ---------------- VPC Interface Endpoints + optional S3 GW ----------------
+  VpceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Project}-ssm-endpoints-sg'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+
+  VpceSSM:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      SecurityGroupIds: [ !Ref VpceSG ]
+      PrivateDnsEnabled: true
+
+  VpceEC2Messages:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      SecurityGroupIds: [ !Ref VpceSG ]
+      PrivateDnsEnabled: true
+
+  VpceSSMMessages:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      SecurityGroupIds: [ !Ref VpceSG ]
+      PrivateDnsEnabled: true
+
+  VpceSecretsManager:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      SecurityGroupIds: [ !Ref VpceSG ]
+      PrivateDnsEnabled: true
+
+  VpceS3:
+    Condition: UseS3GatewayEndpoint
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [ !Ref PrivateRouteTable ]
+
+  # ---------------- SNS + CloudWatch alarms ----------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Project}-alerts'
+
+  AlertsSubscriptionEmail:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Project}-alb-5xx'
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Threshold: 5
+      MetricName: HTTPCode_ELB_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 300
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ALB.LoadBalancerFullName
+      AlarmActions: [ !Ref AlertsTopic ]
+
+  AsgCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Project}-asg-cpu-${AutoScalingGroup}'
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Threshold: 70
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref AlertsTopic ]
+
+Outputs:
+  AlbDnsName:
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}:AlbDnsName'
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}:TargetGroupArn'
+  AlbArnSuffix:
+    Value: !GetAtt ALB.LoadBalancerFullName
+    Export:
+      Name: !Sub '${AWS::StackName}:AlbArnSuffix'
+  AlbSecurityGroupId:
+    Value: !Ref ALBSecurityGroup
+  AsgName:
+    Value: !Ref AutoScalingGroup
+  Ec2SecurityGroupId:
+    Value: !Ref EC2SecurityGroup
+  InstanceProfileName:
+    Value: !Ref InstanceProfile
+  DbEndpoint:
+    Value: !GetAtt DBInstance.Endpoint.Address
+  RdsSecurityGroupId:
+    Value: !Ref RDSSecurityGroup
+  StaticBucketArn:
+    Value: !GetAtt StaticBucket.Arn
+  VpcId:
+    Value: !Ref VPC
+  PublicSubnetIds:
+    Value: !Join [ ",", [ !Ref PublicSubnet1, !Ref PublicSubnet2 ] ]
+  PrivateSubnetIds:
+    Value: !Join [ ",", [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ] ]
+  PrivateRouteTableId:
+    Value: !Ref PrivateRouteTable
+  VpceSsmId:
+    Value: !Ref VpceSSM
+  VpceEc2MessagesId:
+    Value: !Ref VpceEC2Messages
+  VpceSsmMessagesId:
+    Value: !Ref VpceSSMMessages
+  VpceS3Id:
+    Condition: UseS3GatewayEndpoint
+    Value: !Ref VpceS3

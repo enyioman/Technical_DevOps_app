@@ -1,0 +1,13 @@
+# Common VCS dirs
+.git/
+.gitignore
+
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+
+# Archives
+*.tgz

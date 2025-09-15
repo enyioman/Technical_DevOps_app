@@ -1,0 +1,65 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "django-app.fullname" . }}-migrate
+  labels: {{- include "django-app.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    checksum/secret-db: {{ include (print .Template.BasePath "/secret-db.yaml") . | sha256sum }}
+    checksum/settings: {{ include (print .Template.BasePath "/configmap-settings-local.yaml") . | sha256sum }}
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels: {{- include "django-app.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+
+      # --- wait for DB to be reachable ---
+      initContainers:
+        - name: wait-for-db
+          image: busybox:1.36
+          envFrom:
+            - secretRef:
+                name: {{ include "django-app.fullname" . }}-db
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eu
+              echo "Waiting for ${RDS_HOSTNAME}:${RDS_PORT} ..."
+              until nc -z "${RDS_HOSTNAME}" "${RDS_PORT}"; do
+                echo "still waiting..."
+                sleep 2
+              done
+              echo "DB is up."
+
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # run from /app so manage.py is found
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eux
+              cd /app
+              python -V
+              python manage.py migrate --noinput
+          env:
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: "{{ $v }}"
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "django-app.fullname" . }}-db
+          volumeMounts:
+            - name: settings-local
+              mountPath: /app/mysite/settings_local.py
+              subPath: settings_local.py
+      volumes:
+        - name: settings-local
+          configMap:
+            name: {{ include "django-app.fullname" . }}-settings
