@@ -1,4 +1,4 @@
-0) Prereqs
+## Prereqs
 
 AWS CLI v2, kubectl, Helm 3, Terraform ≥ 1.6, Docker (Buildx), jq
 
@@ -12,7 +12,7 @@ export PROJECT=cognetiks-tech
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ```
 
-1) Build & Push the Docker image to ECR
+## Build & Push the Docker image to ECR
 
 Create the repo once (idempotent):
 
@@ -30,7 +30,7 @@ aws ecr get-login-password --region $AWS_REGION \
  | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
 ```
 
-# Build for and push app to AWS Registry
+## Build image and push to AWS registry
 ```
 docker build -t ${PROJECT}-app:latest .
 
@@ -40,7 +40,7 @@ docker tag  ${PROJECT}-app:latest \
 docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT}-app:latest
 ```
 
-2) Provision VPC, EKS & RDS with Terraform
+## Provision VPC, EKS & RDS with Terraform
 
 From infrastructure/:
 
@@ -103,7 +103,7 @@ Prometheus is ClusterIP (by design). To browse it:
 # open http://localhost:9090
 ```
 
-4) Helm-deploy the Django app to EKS
+## Helm-deploy the Django app to EKS
 4.1 App chart defaults to a Network Load Balancer
 
 The chart exposes a Service as LoadBalancer with NLB annotations; the app listens on 8000, service listens on 80.
@@ -155,20 +155,13 @@ kubectl -n $NS get svc web-django-app
 # open http://<NLB-DNS>/
 ```
 
-5) Grafana dashboards
+## Grafana dashboards
 
-With grafana.defaultDashboardsEnabled=true, you’ll have Kubernetes dashboards preloaded:
+![Dashboard](./assets/grafana-dashboard.png)
 
-“Kubernetes / Compute Resources / Namespace (Pods)”
+![Dashboard](./assets/grafana-dashboard1.png)
 
-“Kubernetes / Compute Resources / Workload”
-
-“Kubernetes / Compute Resources / Pod”
-
-Add a custom panel pointing to your app namespace (web) for request rate/latency charts.
-Grafana URL is the monitoring-grafana ELB DNS.
-
-6) HPA
+## HPA
 
 HPA is part of the chart (templates/hpa.yaml). It scales on CPU usage:
 
@@ -185,7 +178,7 @@ hpa:
   targetCPUUtilizationPercentage: 70
 ```
 
-7) Clean up
+## Clean up
 ```
 # App
 helm uninstall web -n web
