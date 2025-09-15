@@ -5,10 +5,6 @@
 - **Secrets Manager** secret containing your DB connection JSON (example below)
 - (Optional) S3 bucket for Django static assets
 
-> 💸 This stack costs money while running. Destroy when done.
-
----
-
 ## Secrets Manager format (expected by bootstrap)
 
 Create (or reuse) a secret with this JSON structure:
@@ -22,8 +18,10 @@ Create (or reuse) a secret with this JSON structure:
   "port": 5432,
   "username": "appuser"
 }
+```
 
-Example `terraform.tfvars`
+Pass the expected json through Terraform. Example `terraform.tfvars`
+
 ```hcl
 
 project         = "cognetiks-tech"
